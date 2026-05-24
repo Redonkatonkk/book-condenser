@@ -1,0 +1,17 @@
+services:
+  book-condenser:
+    image: ${BOOK_CONDENSER_IMAGE:-ghcr.io/redonkatonkk/book-condenser:latest}
+    container_name: book-condenser
+    ports:
+      - "9121:9121"
+    environment:
+      MINIMAX_REGION: "${MINIMAX_REGION:-cn}"
+      MINIMAX_DEFAULT_MODEL: "${MINIMAX_DEFAULT_MODEL:-MiniMax-M2.7}"
+      BOOK_CONDENSER_WORKERS: "${BOOK_CONDENSER_WORKERS:-4}"
+      BOOK_CONDENSER_STORAGE: "/data"
+    volumes:
+      - book-condenser-data:/data
+    restart: unless-stopped
+
+volumes:
+  book-condenser-data:

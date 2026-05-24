@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>书籍浓缩器</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <header class="topbar">
+        <div>
+          <h1>书籍浓缩器</h1>
+          <p id="subtitle">EPUB / PDF / TXT → 浓缩 EPUB</p>
+        </div>
+        <a id="downloadBtn" class="download hidden" href="#" download>下载 EPUB</a>
+      </header>
+
+      <section id="uploadView" class="workspace">
+        <form id="uploadForm" class="upload-panel">
+          <label class="file-drop" for="fileInput">
+            <span id="fileName">选择书籍文件</span>
+            <input id="fileInput" name="file" type="file" accept=".epub,.pdf,.txt" required />
+          </label>
+
+          <label class="field">
+            <span>MiniMax 模型</span>
+            <select id="modelSelect" name="model"></select>
+          </label>
+
+          <label id="regionField" class="field">
+            <span>服务区</span>
+            <select id="regionSelect" name="region"></select>
+          </label>
+
+          <label id="apiKeyField" class="field hidden">
+            <span>MiniMax API Key</span>
+            <input
+              id="apiKeyInput"
+              name="api_key"
+              type="password"
+              autocomplete="off"
+              placeholder="后台未配置，请填写"
+            />
+          </label>
+
+          <button id="startBtn" type="submit">上传并分析</button>
+        </form>
+
+        <section id="analysisPanel" class="analysis-panel hidden">
+          <div>
+            <span class="metric-label">书名</span>
+            <strong id="bookTitle">-</strong>
+          </div>
+          <div>
+            <span class="metric-label">章节</span>
+            <strong id="chapterCount">-</strong>
+          </div>
+          <div>
+            <span class="metric-label">原文字数</span>
+            <strong id="totalCount">-</strong>
+          </div>
+          <div>
+            <span class="metric-label">完整性</span>
+            <strong id="integrityState">-</strong>
+          </div>
+        </section>
+
+        <section id="progressPanel" class="progress-panel hidden">
+          <div class="progress-head">
+            <strong id="statusText">等待任务</strong>
+            <span id="progressText">0%</span>
+          </div>
+          <div class="bar" aria-label="总进度">
+            <div id="progressFill"></div>
+          </div>
+          <div class="progress-foot">
+            <span id="etaText">-</span>
+            <span id="elapsedText">-</span>
+          </div>
+          <p id="errorText" class="error hidden"></p>
+        </section>
+
+        <section id="actionPanel" class="action-panel hidden">
+          <div class="action-row">
+            <button id="condenseOneBtn" type="button">浓缩 1 章</button>
+            <button id="condenseTenBtn" type="button">浓缩 10 章</button>
+            <button id="condenseAllBtn" type="button">浓缩全部</button>
+            <button id="condenseSelectedBtn" type="button">浓缩选中</button>
+            <button id="stopCondenseBtn" class="danger" type="button" disabled>停止任务</button>
+            <button id="retryFailedBtn" type="button">重试失败</button>
+            <button id="exportSelectedBtn" type="button">导出选中</button>
+            <button id="exportDoneBtn" type="button">导出已完成</button>
+          </div>
+          <p id="actionSummary">-</p>
+        </section>
+
+        <section id="chapterPanel" class="chapter-panel hidden">
+          <table>
+            <thead>
+              <tr>
+                <th class="select-col"><input id="selectAllChapters" type="checkbox" /></th>
+                <th>章节</th>
+                <th>原字数</th>
+                <th>状态</th>
+                <th>浓缩后</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody id="chapterRows"></tbody>
+          </table>
+        </section>
+      </section>
+
+      <section id="previewView" class="preview-view hidden">
+        <aside class="chapter-picker">
+          <label class="field">
+            <span>预览章节</span>
+            <select id="chapterSelect"></select>
+          </label>
+          <div id="previewMeta" class="preview-meta"></div>
+        </aside>
+        <article class="preview-doc">
+          <h2 id="previewTitle">-</h2>
+          <div id="previewContent"></div>
+        </article>
+      </section>
+    </main>
+
+    <script src="/app.js"></script>
+  </body>
+</html>

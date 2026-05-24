@@ -1,0 +1,18 @@
+name: book-condenser
+
+services:
+  book-condenser:
+    build: .
+    ports:
+      - "9121:9121"
+    environment:
+      MINIMAX_API_KEY: "${MINIMAX_API_KEY:-}"
+      MINIMAX_REGION: "${MINIMAX_REGION:-cn}"
+      MINIMAX_DEFAULT_MODEL: "${MINIMAX_DEFAULT_MODEL:-MiniMax-M2.7}"
+      BOOK_CONDENSER_WORKERS: "${BOOK_CONDENSER_WORKERS:-4}"
+      BOOK_CONDENSER_STORAGE: "/data"
+    volumes:
+      - book-condenser-data:/data
+
+volumes:
+  book-condenser-data:
