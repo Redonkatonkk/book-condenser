@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import json
 import shutil
 import threading
 import time
@@ -17,6 +19,10 @@ from app.epub_writer import write_condensed_epub
 from app.minimax_client import MiniMaxAuthError, MiniMaxClient
 from app.schemas import Chapter, ChapterStatus, IntegrityReport, JobStatus, ParsedBook
 from app.text_utils import count_units, safe_filename_part
+from app.user_store import UserStore
+
+
+STATE_FILENAME = "job_state.json"
 
 
 @dataclass
@@ -38,11 +44,13 @@ class Job:
     id: str
     filename: str
     model: str
+    user_id: str = ""
     region: str = config.DEFAULT_REGION
     status: JobStatus = JobStatus.queued
     title: str = ""
     author: str = ""
     created_at: float = field(default_factory=time.time)
+    updated_at: float = field(default_factory=time.time)
     started_at: float | None = None
     completed_at: float | None = None
     error: str = ""
@@ -59,6 +67,12 @@ class Job:
     active_batch_started_at: float | None = None
 
 
+@dataclass
+class JobCredential:
+    credential: MiniMaxCredential
+    source: str
+
+
 class JobManager:
     def __init__(
         self,
@@ -69,14 +83,29 @@ class JobManager:
         self.storage_dir = storage_dir
         self.ai_client = ai_client or MiniMaxClient()
         self.credential_store = CredentialStore(storage_dir)
+        self.user_store = UserStore(storage_dir)
         self.max_workers = max_workers
         self.jobs: dict[str, Job] = {}
-        self.job_credentials: dict[str, tuple[MiniMaxCredential, bool]] = {}
+        self.job_credentials: dict[str, JobCredential] = {}
         self.job_source_chapters: dict[str, list[Chapter]] = {}
         self.job_images: dict[str, list[dict]] = {}
         self.active_condense_jobs: set[str] = set()
         self.lock = threading.RLock()
         self.runner = ThreadPoolExecutor(max_workers=2, thread_name_prefix="job-runner")
+        self._load_persisted_jobs()
+
+    def configure_storage(self, storage_dir: Path, load_existing: bool = False) -> None:
+        with self.lock:
+            self.storage_dir = storage_dir
+            self.credential_store = CredentialStore(storage_dir)
+            self.user_store.configure(storage_dir)
+            self.jobs.clear()
+            self.job_credentials.clear()
+            self.job_source_chapters.clear()
+            self.job_images.clear()
+            self.active_condense_jobs.clear()
+            if load_existing:
+                self._load_persisted_jobs()
 
     def create_job(
         self,
@@ -84,14 +113,16 @@ class JobManager:
         model: str,
         api_key: str = "",
         region: str = config.DEFAULT_REGION,
+        user_id: str = "",
     ) -> Job:
         suffix = Path(upload.filename or "").suffix.lower()
         if suffix not in config.ALLOWED_EXTENSIONS:
             raise ValueError("仅支持 EPUB、PDF、TXT 文件。")
         if model not in config.SUPPORTED_MODELS:
             raise ValueError("不支持所选 MiniMax 模型。")
-        credential, from_user = self._resolve_credential(api_key, region)
-        if not config.MOCK_AI and credential is None:
+        credential_ref = self._resolve_credential(api_key, region, user_id)
+        credential = credential_ref.credential if credential_ref else None
+        if not getattr(self.ai_client, "mock_mode", config.MOCK_AI) and credential is None:
             raise ValueError("后台未配置 MiniMax API Key，请填写 API Key 后再开始。")
 
         job_id = uuid.uuid4().hex
@@ -110,19 +141,46 @@ class JobManager:
             id=job_id,
             filename=upload.filename or safe_name,
             model=model,
+            user_id=user_id,
             region=credential.region if credential else region,
             upload_path=str(upload_path),
         )
         with self.lock:
             self.jobs[job_id] = job
-            if credential:
-                self.job_credentials[job_id] = (credential, from_user)
+            if credential_ref:
+                self.job_credentials[job_id] = credential_ref
+            self._persist_job_locked(job_id)
         self.runner.submit(self._analyze_job, job_id)
         return job
 
     def get_job(self, job_id: str) -> Job | None:
         with self.lock:
             return self.jobs.get(job_id)
+
+    def can_access(self, job_id: str, user_id: str = "") -> bool:
+        with self.lock:
+            job = self.jobs.get(job_id)
+            return bool(job and (not job.user_id or job.user_id == user_id))
+
+    def list_user_jobs(self, user_id: str) -> list[dict]:
+        if not user_id:
+            return []
+        with self.lock:
+            jobs = [job for job in self.jobs.values() if job.user_id == user_id]
+            jobs.sort(key=lambda item: item.updated_at or item.created_at, reverse=True)
+            return [self._summary_locked(job) for job in jobs]
+
+    def delete_job(self, job_id: str) -> bool:
+        with self.lock:
+            job = self.jobs.pop(job_id, None)
+            self.job_credentials.pop(job_id, None)
+            self.job_source_chapters.pop(job_id, None)
+            self.job_images.pop(job_id, None)
+            self.active_condense_jobs.discard(job_id)
+        if not job:
+            return False
+        shutil.rmtree(self.storage_dir / "jobs" / job_id, ignore_errors=True)
+        return True
 
     def snapshot(self, job_id: str) -> dict | None:
         with self.lock:
@@ -170,6 +228,14 @@ class JobManager:
             job = self.jobs.get(job_id)
             if not job:
                 return None
+            source = next(
+                (
+                    source_chapter
+                    for source_chapter in self.job_source_chapters.get(job_id, [])
+                    if source_chapter.id == chapter_id
+                ),
+                None,
+            )
             for chapter in job.chapters:
                 if chapter.id == chapter_id:
                     return {
@@ -178,6 +244,8 @@ class JobManager:
                         "status": chapter.status.value,
                         "original_count": chapter.original_count,
                         "condensed_count": chapter.condensed_count,
+                        "original_content": source.text if source else "",
+                        "condensed_content": chapter.condensed_text,
                         "content": chapter.condensed_text,
                         "error": chapter.error,
                     }
@@ -197,6 +265,11 @@ class JobManager:
             selected_ids = self._select_chapter_ids(job, mode, chapter_ids or [])
             if not selected_ids:
                 raise ValueError("没有可浓缩的章节。")
+            credential_ref = self._resolve_credential("", job.region, job.user_id)
+            if credential_ref:
+                self.job_credentials[job_id] = credential_ref
+            elif not getattr(self.ai_client, "mock_mode", config.MOCK_AI):
+                raise ValueError("缺少 MiniMax API Key，请先保存或填写 API Key。")
             for chapter in job.chapters:
                 if chapter.id in selected_ids:
                     chapter.status = ChapterStatus.pending
@@ -214,6 +287,7 @@ class JobManager:
             job.active_batch_started_at = time.time()
             self.active_condense_jobs.add(job_id)
             batch_id = job.active_batch_id
+            self._persist_job_locked(job_id)
         self.runner.submit(self._run_condense_batch, job_id, selected_ids, batch_id)
         return selected_ids
 
@@ -244,6 +318,7 @@ class JobManager:
                     chapter.error = ""
                     chapter.started_at = None
             self.active_condense_jobs.discard(job_id)
+            self._persist_job_locked(job_id)
             return True
 
     def export_epub(self, job_id: str, chapter_ids: list[str] | None = None) -> Path:
@@ -291,18 +366,14 @@ class JobManager:
             if not job:
                 return
             with self.lock:
-                credential_pair = self.job_credentials.get(job_id)
-            credential = credential_pair[0] if credential_pair else None
+                credential_ref = self.job_credentials.get(job_id)
+            credential = credential_ref.credential if credential_ref else None
             self.ai_client.validate_api_key(
                 credential.api_key if credential else None,
                 api_url=credential.resolved_api_url if credential else None,
             )
-            if credential_pair and credential_pair[1]:
-                self.credential_store.save(
-                    credential.api_key,
-                    credential.region,
-                    credential.api_url,
-                )
+            if credential_ref:
+                self._save_validated_credential(job_id, credential_ref)
             parsed = parse_book(Path(job.upload_path), job.filename)
             self._store_parsed_book(job_id, parsed)
             if not parsed.chapters:
@@ -310,14 +381,16 @@ class JobManager:
             with self.lock:
                 job = self.jobs[job_id]
                 job.status = JobStatus.ready
+                self._persist_job_locked(job_id)
         except MiniMaxAuthError as exc:
-            self.credential_store.clear()
+            self._clear_failed_credential(job_id)
             with self.lock:
                 job = self.jobs.get(job_id)
                 if job:
                     job.status = JobStatus.failed
                     job.error = str(exc)
                     job.completed_at = time.time()
+                    self._persist_job_locked(job_id)
         except Exception as exc:
             with self.lock:
                 job = self.jobs.get(job_id)
@@ -325,6 +398,7 @@ class JobManager:
                     job.status = JobStatus.failed
                     job.error = str(exc)
                     job.completed_at = time.time()
+                    self._persist_job_locked(job_id)
         finally:
             pass
 
@@ -344,6 +418,7 @@ class JobManager:
             ]
             self.job_source_chapters[job_id] = parsed.chapters
             self.job_images[job_id] = [asdict(image) for image in parsed.images]
+            self._persist_job_locked(job_id)
 
     def _run_condense_batch(self, job_id: str, chapter_ids: list[str], batch_id: str) -> None:
         try:
@@ -378,6 +453,7 @@ class JobManager:
                     job.active_batch_chapter_ids = []
                     job.stop_requested = False
                     job.active_batch_started_at = None
+                    self._persist_job_locked(job_id)
                 self.active_condense_jobs.discard(job_id)
 
     def _condense_all_chapters(self, job_id: str, chapters: list[Chapter], batch_id: str) -> None:
@@ -409,8 +485,8 @@ class JobManager:
             with self.lock:
                 job = self.jobs[job_id]
                 model = job.model
-                credential_pair = self.job_credentials.get(job_id)
-                credential = credential_pair[0] if credential_pair else None
+                credential_ref = self.job_credentials.get(job_id)
+                credential = credential_ref.credential if credential_ref else None
             minimum_count = max(1, int(chapter.original_count * 0.2 + 0.999))
             condensed = self.ai_client.condense_chapter(
                 chapter.title,
@@ -479,6 +555,7 @@ class JobManager:
             job.status = status
             if started and job.started_at is None:
                 job.started_at = time.time()
+            self._persist_job_locked(job_id)
 
     def _update_chapter(self, job_id: str, chapter_id: str, **changes) -> None:
         with self.lock:
@@ -487,6 +564,7 @@ class JobManager:
                 if chapter.id == chapter_id:
                     for key, value in changes.items():
                         setattr(chapter, key, value)
+                    self._persist_job_locked(job_id)
                     return
             raise KeyError(chapter_id)
 
@@ -495,6 +573,7 @@ class JobManager:
             job = self.jobs.get(job_id)
             if job:
                 job.active_batch_done += 1
+                self._persist_job_locked(job_id)
 
     def _is_batch_active(self, job_id: str, batch_id: str) -> bool:
         with self.lock:
@@ -554,27 +633,35 @@ class JobManager:
         job.active_batch_started_at = None
 
     def _resolve_credential(
-        self, api_key: str, region: str
-    ) -> tuple[MiniMaxCredential | None, bool]:
+        self, api_key: str, region: str, user_id: str = ""
+    ) -> JobCredential | None:
         normalized_region = region.strip().lower()
         if normalized_region not in config.REGION_ENDPOINTS:
             normalized_region = config.DEFAULT_REGION
         task_api_key = api_key.strip()
         if task_api_key:
-            return MiniMaxCredential(api_key=task_api_key, region=normalized_region), True
+            source = "user_input" if user_id else "guest_input"
+            return JobCredential(
+                MiniMaxCredential(api_key=task_api_key, region=normalized_region),
+                source,
+            )
+        if user_id:
+            user_credential = self.user_store.get_credential(user_id)
+            if user_credential:
+                return JobCredential(user_credential, "user_saved")
         if self.ai_client.api_key:
-            return (
+            return JobCredential(
                 MiniMaxCredential(
                     api_key=self.ai_client.api_key,
                     region=config.DEFAULT_REGION,
                     api_url=self.ai_client.api_url,
                 ),
-                False,
+                "server",
             )
         stored = self.credential_store.load()
         if stored:
-            return stored, False
-        return None, False
+            return JobCredential(stored, "global_saved")
+        return None
 
     def _select_chapter_ids(self, job: Job, mode: str, chapter_ids: list[str]) -> list[str]:
         chapter_by_id = {chapter.id: chapter for chapter in job.chapters}
@@ -601,3 +688,171 @@ class JobManager:
         if mode == "all":
             return candidates
         raise ValueError("未知浓缩模式。")
+
+    def _summary_locked(self, job: Job) -> dict:
+        completed = sum(1 for chapter in job.chapters if chapter.status == ChapterStatus.done)
+        running = sum(1 for chapter in job.chapters if chapter.status == ChapterStatus.running)
+        failed = sum(1 for chapter in job.chapters if chapter.status == ChapterStatus.failed)
+        total = len(job.chapters)
+        progress = 0
+        if job.status == JobStatus.completed:
+            progress = 100
+        elif total:
+            progress = int((completed + running * 0.5) / total * 100)
+        return {
+            "id": job.id,
+            "filename": job.filename,
+            "title": job.title,
+            "author": job.author,
+            "status": job.status.value,
+            "progress": progress,
+            "completed_count": completed,
+            "failed_count": failed,
+            "chapter_count": total,
+            "download_ready": completed > 0,
+            "created_at": job.created_at,
+            "updated_at": job.updated_at,
+            "error": job.error,
+        }
+
+    def _save_validated_credential(self, job_id: str, credential_ref: JobCredential) -> None:
+        with self.lock:
+            job = self.jobs.get(job_id)
+        credential = credential_ref.credential
+        if credential_ref.source == "user_input" and job and job.user_id:
+            self.user_store.save_api_key(
+                job.user_id,
+                credential.api_key,
+                credential.region,
+                credential.api_url,
+            )
+        elif credential_ref.source == "guest_input":
+            self.credential_store.save(
+                credential.api_key,
+                credential.region,
+                credential.api_url,
+            )
+
+    def _clear_failed_credential(self, job_id: str) -> None:
+        with self.lock:
+            job = self.jobs.get(job_id)
+            credential_ref = self.job_credentials.get(job_id)
+        if not credential_ref:
+            return
+        if credential_ref.source == "user_saved" and job and job.user_id:
+            self.user_store.clear_api_key(job.user_id)
+        elif credential_ref.source == "global_saved":
+            self.credential_store.clear()
+
+    def _persist_job_locked(self, job_id: str) -> None:
+        job = self.jobs.get(job_id)
+        if not job:
+            return
+        job.updated_at = time.time()
+        job_dir = self.storage_dir / "jobs" / job_id
+        job_dir.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "version": 1,
+            "job": self._serialize_job(job),
+            "source_chapters": [
+                asdict(chapter) for chapter in self.job_source_chapters.get(job_id, [])
+            ],
+            "images": [self._serialize_image(image) for image in self.job_images.get(job_id, [])],
+        }
+        state_path = job_dir / STATE_FILENAME
+        tmp_path = state_path.with_suffix(".tmp")
+        tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp_path.replace(state_path)
+
+    def _serialize_job(self, job: Job) -> dict:
+        data = asdict(job)
+        data["status"] = job.status.value
+        data["integrity"] = asdict(job.integrity) if job.integrity else None
+        data["chapters"] = [
+            {
+                **asdict(chapter),
+                "status": chapter.status.value,
+            }
+            for chapter in job.chapters
+        ]
+        return data
+
+    def _serialize_image(self, image: dict) -> dict:
+        data = dict(image)
+        content = data.get("content", b"")
+        if isinstance(content, bytes):
+            data["content_b64"] = base64.b64encode(content).decode("ascii")
+        else:
+            data["content_b64"] = str(content)
+        data.pop("content", None)
+        return data
+
+    def _load_persisted_jobs(self) -> None:
+        jobs_dir = self.storage_dir / "jobs"
+        if not jobs_dir.exists():
+            return
+        for state_path in jobs_dir.glob(f"*/{STATE_FILENAME}"):
+            try:
+                payload = json.loads(state_path.read_text(encoding="utf-8"))
+                job = self._deserialize_job(payload.get("job", {}))
+                source_chapters = [
+                    Chapter(**chapter_data)
+                    for chapter_data in payload.get("source_chapters", [])
+                ]
+                images = [
+                    self._deserialize_image(image_data)
+                    for image_data in payload.get("images", [])
+                ]
+                self._normalize_loaded_job(job)
+                self.jobs[job.id] = job
+                self.job_source_chapters[job.id] = source_chapters
+                self.job_images[job.id] = images
+            except Exception:
+                continue
+
+    def _deserialize_job(self, data: dict) -> Job:
+        integrity_data = data.get("integrity")
+        chapters = []
+        for chapter_data in data.get("chapters", []):
+            item = dict(chapter_data)
+            item["status"] = ChapterStatus(item.get("status", ChapterStatus.pending.value))
+            chapters.append(ChapterProgress(**item))
+        job_data = dict(data)
+        job_data["status"] = JobStatus(job_data.get("status", JobStatus.queued.value))
+        job_data["integrity"] = IntegrityReport(**integrity_data) if integrity_data else None
+        job_data["chapters"] = chapters
+        allowed = set(Job.__dataclass_fields__)
+        job_data = {key: value for key, value in job_data.items() if key in allowed}
+        return Job(**job_data)
+
+    def _deserialize_image(self, data: dict) -> dict:
+        image = dict(data)
+        content_b64 = image.pop("content_b64", "")
+        image["content"] = base64.b64decode(content_b64.encode("ascii")) if content_b64 else b""
+        return image
+
+    def _normalize_loaded_job(self, job: Job) -> None:
+        if job.status == JobStatus.condensing:
+            active_ids = set(job.active_batch_chapter_ids)
+            for chapter in job.chapters:
+                if chapter.id in active_ids and chapter.status == ChapterStatus.running:
+                    chapter.status = ChapterStatus.pending
+                    chapter.progress = 0
+                    chapter.error = ""
+                    chapter.started_at = None
+            job.status = JobStatus.ready
+            job.error = "服务重启后已暂停，可继续浓缩未完成章节。"
+        elif job.status in {JobStatus.queued, JobStatus.analyzing, JobStatus.building}:
+            if job.chapters:
+                job.status = JobStatus.ready
+                job.error = "服务重启后已暂停，可继续操作。"
+            else:
+                job.status = JobStatus.failed
+                job.error = "服务重启时书籍尚未完成分析，请重新上传。"
+                job.completed_at = time.time()
+        job.active_batch_total = 0
+        job.active_batch_done = 0
+        job.active_batch_id = ""
+        job.active_batch_chapter_ids = []
+        job.stop_requested = False
+        job.active_batch_started_at = None

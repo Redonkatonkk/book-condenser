@@ -1,3 +1,5 @@
+name: book-condenser
+
 services:
   book-condenser:
     image: ${BOOK_CONDENSER_IMAGE:-ghcr.io/redonkatonkk/book-condenser:latest}

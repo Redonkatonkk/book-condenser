@@ -15,7 +15,7 @@ from app.minimax_client import MiniMaxAuthError
 
 
 def test_upload_poll_preview_and_download(tmp_path: Path) -> None:
-    manager.storage_dir = tmp_path
+    reset_app_manager(tmp_path)
     manager.ai_client.mock_mode = True
     client = TestClient(app)
 
@@ -68,6 +68,22 @@ def test_job_requires_api_key_when_backend_has_none(tmp_path: Path, monkeypatch)
         assert "API Key" in str(exc)
     else:
         raise AssertionError("missing API key should be rejected")
+
+
+def test_mock_client_mode_without_backend_key_allows_job(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(job_manager_module.config, "MOCK_AI", False)
+    client = DummyClient(api_key="")
+    client.mock_mode = True
+    isolated = JobManager(storage_dir=tmp_path, ai_client=client)
+    upload = UploadFile(
+        file=io.BytesIO("第一章\n这是正文内容。".encode("utf-8")),
+        filename="sample.txt",
+    )
+
+    job = isolated.create_job(upload, "MiniMax-M2.7")
+    snapshot = wait_for_manager_status(isolated, job.id, {"ready", "failed"})
+
+    assert snapshot["status"] == "ready", snapshot
 
 
 def test_user_supplied_api_key_is_used_and_not_exposed(tmp_path: Path, monkeypatch) -> None:
@@ -161,6 +177,137 @@ def test_partial_condense_retry_failed_and_selected_export(tmp_path: Path) -> No
     assert export_path.suffix == ".epub"
 
 
+def test_export_download_uses_exact_export_id_not_glob(tmp_path: Path) -> None:
+    reset_app_manager(tmp_path)
+    client = TestClient(app)
+    create = client.post(
+        "/api/jobs",
+        data={"model": "MiniMax-M2.7"},
+        files={
+            "file": (
+                "sample.txt",
+                "第一章\n这是第一章正文。\n\n第二章\n这是第二章正文。".encode("utf-8"),
+                "text/plain",
+            )
+        },
+    )
+    assert create.status_code == 200
+    job_id = create.json()["job_id"]
+    snapshot = wait_for_status(client, job_id, {"ready", "failed"})
+    assert snapshot["status"] == "ready"
+    start = client.post(f"/api/jobs/{job_id}/condense", json={"mode": "all"})
+    assert start.status_code == 200
+    snapshot = wait_for_status(client, job_id, {"completed", "failed"})
+    assert snapshot["status"] == "completed"
+
+    export = client.post(f"/api/jobs/{job_id}/exports", json={"chapter_ids": []})
+    assert export.status_code == 200
+    assert client.get(export.json()["download_url"]).status_code == 200
+    assert client.get(f"/api/jobs/{job_id}/exports/*/download").status_code == 404
+
+
+def test_login_personal_library_and_job_access(tmp_path: Path) -> None:
+    reset_app_manager(tmp_path)
+    client = TestClient(app)
+    other_client = TestClient(app)
+
+    register = client.post(
+        "/api/auth/register",
+        json={"email": "reader@example.com", "password": "secretpw"},
+    )
+    assert register.status_code == 200
+    assert register.json()["user"]["email"] == "reader@example.com"
+
+    save_key = client.put(
+        "/api/account/api-key",
+        json={"api_key": "user-key", "region": "global"},
+    )
+    assert save_key.status_code == 200
+    assert save_key.json()["has_api_key"] is True
+
+    create = client.post(
+        "/api/jobs",
+        data={"model": "MiniMax-M2.7"},
+        files={
+            "file": (
+                "sample.txt",
+                "第一章\n这是第一章正文。\n\n第二章\n这是第二章正文。".encode("utf-8"),
+                "text/plain",
+            )
+        },
+    )
+    assert create.status_code == 200
+    job_id = create.json()["job_id"]
+    snapshot = wait_for_status(client, job_id, {"ready", "failed"})
+    assert snapshot["status"] == "ready"
+    assert manager.get_job(job_id).user_id == register.json()["user"]["id"]
+
+    assert other_client.get(f"/api/jobs/{job_id}").status_code == 404
+
+    library = client.get("/api/me/jobs")
+    assert library.status_code == 200
+    assert [job["id"] for job in library.json()["jobs"]] == [job_id]
+
+    deleted = client.delete(f"/api/jobs/{job_id}")
+    assert deleted.status_code == 200
+    assert deleted.json()["deleted"] is True
+    assert client.get("/api/me/jobs").json()["jobs"] == []
+
+
+def test_user_key_is_used_and_job_state_survives_reload(tmp_path: Path) -> None:
+    client_impl = DummyClient(api_key="server-key")
+    isolated = JobManager(storage_dir=tmp_path, ai_client=client_impl)
+    user = isolated.user_store.create_user("persist@example.com", "secretpw")
+    isolated.user_store.save_api_key(user.id, "user-key", "global")
+    upload = UploadFile(
+        file=io.BytesIO(
+            "第一章 开端\n这是第一章正文。\n\n第二章 线索\n这是第二章正文。".encode("utf-8")
+        ),
+        filename="sample.txt",
+    )
+
+    job = isolated.create_job(upload, "MiniMax-M2.7", user_id=user.id)
+    snapshot = wait_for_manager_status(isolated, job.id, {"ready", "failed"})
+    assert snapshot["status"] == "ready"
+    isolated.condense(job.id, "all")
+    snapshot = wait_for_manager_status(isolated, job.id, {"completed", "failed"})
+    assert snapshot["status"] == "completed"
+    assert client_impl.seen_api_key == "user-key"
+
+    chapter_id = snapshot["chapters"][0]["id"]
+    chapter = isolated.get_chapter_content(job.id, chapter_id)
+    assert "第一章正文" in chapter["original_content"]
+    assert chapter["condensed_content"]
+
+    reloaded = JobManager(storage_dir=tmp_path, ai_client=DummyClient(api_key="server-key"))
+    restored = reloaded.snapshot(job.id)
+    assert restored["status"] == "completed"
+    assert reloaded.list_user_jobs(user.id)[0]["id"] == job.id
+    restored_chapter = reloaded.get_chapter_content(job.id, chapter_id)
+    assert restored_chapter["original_content"] == chapter["original_content"]
+    assert restored_chapter["condensed_content"] == chapter["condensed_content"]
+
+
+def test_export_with_long_book_title_uses_safe_filename(tmp_path: Path) -> None:
+    long_title = "超长标题" * 80
+    isolated = JobManager(storage_dir=tmp_path, ai_client=DummyClient(api_key="server-key"))
+    upload = UploadFile(
+        file=io.BytesIO("第一章\n这是正文内容。".encode("utf-8")),
+        filename=f"{long_title}.txt",
+    )
+    job = isolated.create_job(upload, "MiniMax-M2.7")
+    snapshot = wait_for_manager_status(isolated, job.id, {"ready", "failed"})
+    assert snapshot["status"] == "ready"
+    isolated.condense(job.id, "all")
+    snapshot = wait_for_manager_status(isolated, job.id, {"completed", "failed"})
+    assert snapshot["status"] == "completed"
+
+    export_path = isolated.export_epub(job.id)
+
+    assert export_path.exists()
+    assert len(export_path.name) < 120
+
+
 def test_prompt_receives_minimum_count_and_stop_batch(tmp_path: Path) -> None:
     client_impl = SlowClient(api_key="server-key")
     isolated = JobManager(storage_dir=tmp_path, ai_client=client_impl, max_workers=1)
@@ -189,6 +336,9 @@ def test_prompt_receives_minimum_count_and_stop_batch(tmp_path: Path) -> None:
     snapshot = isolated.snapshot(job.id)
     assert snapshot["status"] == "ready"
     assert any(chapter["status"] == "pending" for chapter in snapshot["chapters"])
+    elapsed_after_stop = snapshot["elapsed_seconds"]
+    time.sleep(0.5)
+    assert isolated.snapshot(job.id)["elapsed_seconds"] == elapsed_after_stop
 
 
 class DummyClient:
@@ -302,3 +452,14 @@ def wait_for_manager_status(manager: JobManager, job_id: str, statuses: set[str]
             return snapshot
         time.sleep(0.1)
     raise AssertionError(f"job did not reach {statuses}: {snapshot}")
+
+
+def reset_app_manager(tmp_path: Path) -> None:
+    manager.configure_storage(tmp_path)
+    manager.ai_client.mock_mode = True
+    with manager.lock:
+        manager.jobs.clear()
+        manager.job_credentials.clear()
+        manager.job_source_chapters.clear()
+        manager.job_images.clear()
+        manager.active_condense_jobs.clear()

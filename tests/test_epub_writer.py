@@ -5,6 +5,7 @@ from pathlib import Path
 from ebooklib import ITEM_DOCUMENT, epub
 
 from app.epub_writer import write_condensed_epub
+from app.text_utils import safe_filename_part
 
 
 def test_write_condensed_epub_is_readable(tmp_path: Path) -> None:
@@ -25,3 +26,21 @@ def test_write_condensed_epub_is_readable(tmp_path: Path) -> None:
     docs = list(parsed.get_items_of_type(ITEM_DOCUMENT))
     assert len(docs) >= 2
     assert parsed.get_metadata("DC", "title")[0][0] == "测试书 - 浓缩版"
+
+
+def test_write_condensed_epub_truncates_internal_chapter_filenames(tmp_path: Path) -> None:
+    long_title = "超长标题" * 80
+    output = tmp_path / "out.epub"
+    write_condensed_epub(
+        output,
+        identifier="job-long",
+        title=long_title,
+        author="",
+        chapters=[{"title": long_title, "content": "浓缩后的章节。"}],
+    )
+
+    assert output.exists()
+    assert len(safe_filename_part(long_title)) <= 80
+    parsed = epub.read_epub(str(output))
+    docs = list(parsed.get_items_of_type(ITEM_DOCUMENT))
+    assert docs

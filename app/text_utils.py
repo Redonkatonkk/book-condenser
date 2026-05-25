@@ -36,6 +36,8 @@ def paragraphs_to_html(text: str) -> str:
     return "\n".join(f"<p>{html.escape(block).replace(chr(10), '<br/>')}</p>" for block in blocks)
 
 
-def safe_filename_part(value: str, fallback: str = "book") -> str:
+def safe_filename_part(value: str, fallback: str = "book", max_length: int = 80) -> str:
     value = re.sub(r"[^\w\u4e00-\u9fff.-]+", "_", value, flags=re.UNICODE).strip("._")
+    if max_length > 0 and len(value) > max_length:
+        value = value[:max_length].strip("._")
     return value or fallback

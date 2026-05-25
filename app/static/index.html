@@ -13,8 +13,109 @@
           <h1>书籍浓缩器</h1>
           <p id="subtitle">EPUB / PDF / TXT → 浓缩 EPUB</p>
         </div>
-        <a id="downloadBtn" class="download hidden" href="#" download>下载 EPUB</a>
+        <div class="top-actions">
+          <button id="workspaceBtn" class="secondary hidden" type="button">浓缩页面</button>
+          <button id="libraryBtn" class="secondary hidden" type="button">个人页面</button>
+          <a id="downloadBtn" class="download hidden" href="#" download>下载 EPUB</a>
+          <button id="loginOpenBtn" type="button">登录</button>
+          <div id="userBadge" class="user-badge hidden">
+            <span id="userEmail"></span>
+            <button id="logoutBtn" class="secondary" type="button">退出</button>
+          </div>
+        </div>
       </header>
+
+      <p id="globalError" class="error global-error hidden"></p>
+
+      <section id="authPanel" class="auth-panel hidden">
+        <form id="loginForm" class="auth-card">
+          <h2>登录</h2>
+          <label class="field">
+            <span>Email</span>
+            <input id="loginEmail" name="email" type="email" autocomplete="email" required />
+          </label>
+          <label class="field">
+            <span>密码</span>
+            <input
+              id="loginPassword"
+              name="password"
+              type="password"
+              autocomplete="current-password"
+              required
+            />
+          </label>
+          <button type="submit">登录</button>
+        </form>
+
+        <form id="registerForm" class="auth-card">
+          <h2>创建账户</h2>
+          <label class="field">
+            <span>Email</span>
+            <input id="registerEmail" name="email" type="email" autocomplete="email" required />
+          </label>
+          <label class="field">
+            <span>密码</span>
+            <input
+              id="registerPassword"
+              name="password"
+              type="password"
+              autocomplete="new-password"
+              minlength="6"
+              required
+            />
+          </label>
+          <button type="submit">创建并进入</button>
+        </form>
+      </section>
+
+      <section id="libraryView" class="library-view hidden">
+        <section class="account-panel">
+          <div>
+            <span class="metric-label">账户</span>
+            <strong id="accountEmail">-</strong>
+          </div>
+          <form id="accountKeyForm" class="account-key-form">
+            <label class="field">
+              <span>个人 MiniMax API Key</span>
+              <input
+                id="accountApiKeyInput"
+                name="api_key"
+                type="password"
+                autocomplete="off"
+                placeholder="留空不改变"
+              />
+            </label>
+            <label class="field">
+              <span>服务区</span>
+              <select id="accountRegionSelect" name="region"></select>
+            </label>
+            <button type="submit">保存 Key</button>
+            <button id="clearAccountKeyBtn" class="secondary" type="button">清除 Key</button>
+          </form>
+          <span id="accountKeyStatus" class="key-status">-</span>
+        </section>
+
+        <section class="library-panel">
+          <div class="panel-head">
+            <h2>我的书籍</h2>
+            <button id="refreshLibraryBtn" class="secondary" type="button">刷新</button>
+          </div>
+          <div id="libraryEmpty" class="empty hidden">暂无书籍</div>
+          <table id="libraryTable">
+            <thead>
+              <tr>
+                <th>书籍</th>
+                <th>状态</th>
+                <th>进度</th>
+                <th>章节</th>
+                <th>更新时间</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody id="libraryRows"></tbody>
+          </table>
+        </section>
+      </section>
 
       <section id="uploadView" class="workspace">
         <form id="uploadForm" class="upload-panel">
@@ -113,16 +214,19 @@
       </section>
 
       <section id="previewView" class="preview-view hidden">
-        <aside class="chapter-picker">
-          <label class="field">
-            <span>预览章节</span>
-            <select id="chapterSelect"></select>
-          </label>
-          <div id="previewMeta" class="preview-meta"></div>
-        </aside>
-        <article class="preview-doc">
-          <h2 id="previewTitle">-</h2>
-          <div id="previewContent"></div>
+        <article class="preview-doc original-doc">
+          <div class="preview-head">
+            <h2 id="previewOriginalTitle">原始章节</h2>
+            <span id="originalCountText">-</span>
+          </div>
+          <div id="originalContent" class="chapter-content"></div>
+        </article>
+        <article class="preview-doc condensed-doc">
+          <div class="preview-head">
+            <h2 id="previewTitle">浓缩章节</h2>
+            <span id="condensedCountText">-</span>
+          </div>
+          <div id="previewContent" class="chapter-content"></div>
         </article>
       </section>
     </main>

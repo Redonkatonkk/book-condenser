@@ -1,12 +1,13 @@
 const ACTIVE_JOB_KEY = "bookCondenser.activeJobId";
 
 const state = {
+  user: null,
   jobId: null,
   poller: null,
   lastJob: null,
-  previewLoaded: false,
   hasBackendApiKey: true,
   selectedChapters: new Set(),
+  libraryJobs: [],
 };
 
 const $ = (id) => document.getElementById(id);
@@ -29,28 +30,35 @@ const chapterStatusLabels = {
 };
 
 async function init() {
-  const response = await fetch("/api/models");
-  const data = await response.json();
-  $("modelSelect").innerHTML = data.models
-    .map((model) => `<option value="${escapeHtml(model)}">${escapeHtml(model)}</option>`)
-    .join("");
-  $("modelSelect").value = data.default;
-  $("regionSelect").innerHTML = data.regions
-    .map((region) => `<option value="${escapeHtml(region.id)}">${escapeHtml(region.label)}</option>`)
-    .join("");
-  $("regionSelect").value = data.stored_region || data.default_region || "cn";
-  state.hasBackendApiKey = Boolean(data.has_api_key);
-  renderApiKeyRequirement();
   bindActions();
+  await refreshAuth();
+  await loadModels();
 
   const savedJobId = localStorage.getItem(ACTIVE_JOB_KEY);
   if (savedJobId) {
     state.jobId = savedJobId;
+    showWorkspace();
     startPolling();
+    return;
+  }
+  if (state.user) {
+    await showLibrary();
+  } else {
+    showWorkspace();
   }
 }
 
 function bindActions() {
+  $("loginOpenBtn").addEventListener("click", showAuthPanel);
+  $("workspaceBtn").addEventListener("click", showWorkspace);
+  $("libraryBtn").addEventListener("click", () => showLibrary());
+  $("logoutBtn").addEventListener("click", logout);
+  $("loginForm").addEventListener("submit", (event) => submitAuth(event, "login"));
+  $("registerForm").addEventListener("submit", (event) => submitAuth(event, "register"));
+  $("accountKeyForm").addEventListener("submit", saveAccountKey);
+  $("clearAccountKeyBtn").addEventListener("click", clearAccountKey);
+  $("refreshLibraryBtn").addEventListener("click", refreshLibrary);
+
   $("condenseOneBtn").addEventListener("click", () => startCondense("one"));
   $("condenseTenBtn").addEventListener("click", () => startCondense("ten"));
   $("condenseAllBtn").addEventListener("click", () => startCondense("all"));
@@ -70,26 +78,268 @@ function bindActions() {
     }
     renderJob(state.lastJob);
   });
+
+  $("fileInput").addEventListener("change", (event) => {
+    const file = event.target.files[0];
+    $("fileName").textContent = file ? file.name : "选择书籍文件";
+  });
+
+  $("uploadForm").addEventListener("submit", createJobFromUpload);
 }
 
-$("fileInput").addEventListener("change", (event) => {
-  const file = event.target.files[0];
-  $("fileName").textContent = file ? file.name : "选择书籍文件";
-});
+async function refreshAuth() {
+  const response = await fetch("/api/auth/me");
+  const data = await response.json();
+  state.user = data.authenticated ? data.user : null;
+  renderAuth();
+}
 
-$("uploadForm").addEventListener("submit", async (event) => {
+async function loadModels() {
+  const response = await fetch("/api/models");
+  const data = await response.json();
+  $("modelSelect").innerHTML = data.models
+    .map((model) => `<option value="${escapeHtml(model)}">${escapeHtml(model)}</option>`)
+    .join("");
+  $("modelSelect").value = data.default;
+  const regionOptions = data.regions
+    .map((region) => `<option value="${escapeHtml(region.id)}">${escapeHtml(region.label)}</option>`)
+    .join("");
+  $("regionSelect").innerHTML = regionOptions;
+  $("accountRegionSelect").innerHTML = regionOptions;
+  const selectedRegion = data.stored_region || data.default_region || "cn";
+  $("regionSelect").value = selectedRegion;
+  $("accountRegionSelect").value = selectedRegion;
+  state.hasBackendApiKey = Boolean(data.has_api_key);
+  renderApiKeyRequirement();
+  renderAccount();
+}
+
+function renderAuth() {
+  const loggedIn = Boolean(state.user);
+  $("loginOpenBtn").classList.toggle("hidden", loggedIn);
+  $("userBadge").classList.toggle("hidden", !loggedIn);
+  $("libraryBtn").classList.toggle("hidden", !loggedIn);
+  $("workspaceBtn").classList.toggle("hidden", false);
+  $("userEmail").textContent = state.user?.email || "";
+  renderAccount();
+}
+
+function renderAccount() {
+  $("accountEmail").textContent = state.user?.email || "-";
+  $("accountKeyStatus").textContent = state.user?.has_api_key ? "已保存个人 Key" : "未保存个人 Key";
+}
+
+function showAuthPanel() {
+  window.scrollTo(0, 0);
+  $("authPanel").classList.remove("hidden");
+  $("libraryView").classList.add("hidden");
+  $("uploadView").classList.add("hidden");
+  $("previewView").classList.add("hidden");
+  $("downloadBtn").classList.add("hidden");
+  $("subtitle").textContent = "登录后可管理个人书库";
+}
+
+function showWorkspace() {
+  window.scrollTo(0, 0);
+  $("authPanel").classList.add("hidden");
+  $("libraryView").classList.add("hidden");
+  $("uploadView").classList.remove("hidden");
+  $("previewView").classList.add("hidden");
+  if (state.lastJob) {
+    renderJob(state.lastJob);
+  } else {
+    $("downloadBtn").classList.add("hidden");
+    $("subtitle").textContent = "EPUB / PDF / TXT → 浓缩 EPUB";
+  }
+}
+
+async function showLibrary() {
+  if (!state.user) {
+    showAuthPanel();
+    return;
+  }
+  window.scrollTo(0, 0);
+  $("authPanel").classList.add("hidden");
+  $("uploadView").classList.add("hidden");
+  $("previewView").classList.add("hidden");
+  $("downloadBtn").classList.add("hidden");
+  $("libraryView").classList.remove("hidden");
+  $("subtitle").textContent = "个人书库";
+  await refreshLibrary();
+}
+
+async function submitAuth(event, mode) {
+  event.preventDefault();
+  const prefix = mode === "login" ? "login" : "register";
+  const email = $(`${prefix}Email`).value.trim();
+  const password = $(`${prefix}Password`).value;
+  try {
+    const response = await fetch(`/api/auth/${mode}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email, password }),
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.detail || "认证失败");
+    state.user = data.user;
+    renderAuth();
+    await loadModels();
+    await showLibrary();
+  } catch (error) {
+    showError(error.message);
+  }
+}
+
+async function logout() {
+  await fetch("/api/auth/logout", { method: "POST" });
+  state.user = null;
+  state.libraryJobs = [];
+  renderAuth();
+  await loadModels();
+  showWorkspace();
+}
+
+async function saveAccountKey(event) {
+  event.preventDefault();
+  const apiKey = $("accountApiKeyInput").value.trim();
+  if (!apiKey) {
+    showError("请输入要保存的 API Key。");
+    $("accountApiKeyInput").focus();
+    return;
+  }
+  try {
+    const response = await fetch("/api/account/api-key", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        api_key: apiKey,
+        region: $("accountRegionSelect").value,
+      }),
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.detail || "保存失败");
+    $("accountApiKeyInput").value = "";
+    state.user.has_api_key = data.has_api_key;
+    state.user.region = data.region;
+    hideError();
+    await loadModels();
+  } catch (error) {
+    showError(error.message);
+  }
+}
+
+async function clearAccountKey() {
+  try {
+    const response = await fetch("/api/account/api-key", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ api_key: "", region: $("accountRegionSelect").value }),
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.detail || "清除失败");
+    state.user.has_api_key = data.has_api_key;
+    hideError();
+    await loadModels();
+  } catch (error) {
+    showError(error.message);
+  }
+}
+
+async function refreshLibrary() {
+  if (!state.user) return;
+  try {
+    const response = await fetch("/api/me/jobs");
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.detail || "读取书库失败");
+    state.libraryJobs = data.jobs || [];
+    renderLibrary();
+  } catch (error) {
+    showError(error.message);
+  }
+}
+
+function renderLibrary() {
+  const jobs = state.libraryJobs;
+  $("libraryEmpty").classList.toggle("hidden", jobs.length > 0);
+  $("libraryTable").classList.toggle("hidden", jobs.length === 0);
+  $("libraryRows").innerHTML = jobs.map(renderLibraryRow).join("");
+  bindLibraryRows();
+}
+
+function renderLibraryRow(job) {
+  const title = job.title || job.filename || "未命名书籍";
+  const downloadButton = job.download_ready
+    ? `<button class="row-action download-library" data-job-id="${escapeHtml(job.id)}" type="button">下载</button>`
+    : "";
+  return `
+    <tr>
+      <td>
+        <div class="library-title" title="${escapeHtml(title)}">${escapeHtml(title)}</div>
+        <div class="library-filename">${escapeHtml(job.filename || "")}</div>
+      </td>
+      <td><span class="pill status-${escapeHtml(job.status)}">${statusLabels[job.status] || job.status}</span></td>
+      <td>${formatNumber(job.progress)}%</td>
+      <td>${formatNumber(job.completed_count)}/${formatNumber(job.chapter_count)}</td>
+      <td>${formatDate(job.updated_at)}</td>
+      <td>
+        <button class="row-action continue-library" data-job-id="${escapeHtml(job.id)}" type="button">继续</button>
+        ${downloadButton}
+        <button class="row-action delete-library danger-text" data-job-id="${escapeHtml(job.id)}" type="button">删除</button>
+      </td>
+    </tr>
+  `;
+}
+
+function bindLibraryRows() {
+  document.querySelectorAll(".continue-library").forEach((button) => {
+    button.addEventListener("click", () => loadJob(button.dataset.jobId));
+  });
+  document.querySelectorAll(".download-library").forEach((button) => {
+    button.addEventListener("click", () => downloadJob(button.dataset.jobId));
+  });
+  document.querySelectorAll(".delete-library").forEach((button) => {
+    button.addEventListener("click", () => deleteJob(button.dataset.jobId));
+  });
+}
+
+async function loadJob(jobId) {
+  state.jobId = jobId;
+  state.selectedChapters.clear();
+  localStorage.setItem(ACTIVE_JOB_KEY, jobId);
+  showWorkspace();
+  startPolling();
+}
+
+async function deleteJob(jobId) {
+  if (!confirm("删除这本书及其本地结果？")) return;
+  try {
+    const response = await fetch(`/api/jobs/${jobId}`, { method: "DELETE" });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.detail || "删除失败");
+    if (state.jobId === jobId) {
+      state.jobId = null;
+      state.lastJob = null;
+      localStorage.removeItem(ACTIVE_JOB_KEY);
+    }
+    await refreshLibrary();
+  } catch (error) {
+    showError(error.message);
+  }
+}
+
+async function createJobFromUpload(event) {
   event.preventDefault();
   const file = $("fileInput").files[0];
   if (!file) return;
   const apiKey = $("apiKeyInput").value.trim();
   if (!state.hasBackendApiKey && !apiKey) {
-    showError("后台未配置 MiniMax API Key，请先填写 API Key。");
+    showError("请先填写 MiniMax API Key。");
     $("apiKeyInput").focus();
     return;
   }
 
   $("startBtn").disabled = true;
-  $("errorText").classList.add("hidden");
+  hideError();
   $("analysisPanel").classList.add("hidden");
   $("actionPanel").classList.add("hidden");
   $("progressPanel").classList.remove("hidden");
@@ -106,7 +356,7 @@ $("uploadForm").addEventListener("submit", async (event) => {
   form.append("file", file);
   form.append("model", $("modelSelect").value);
   form.append("region", $("regionSelect").value);
-  if (!state.hasBackendApiKey) form.append("api_key", apiKey);
+  if (apiKey) form.append("api_key", apiKey);
 
   try {
     const response = await fetch("/api/jobs", { method: "POST", body: form });
@@ -114,17 +364,12 @@ $("uploadForm").addEventListener("submit", async (event) => {
     if (!response.ok) throw new Error(data.detail || "创建任务失败");
     state.jobId = data.job_id;
     localStorage.setItem(ACTIVE_JOB_KEY, state.jobId);
-    state.previewLoaded = false;
     startPolling();
   } catch (error) {
     showError(error.message);
     $("startBtn").disabled = false;
   }
-});
-
-$("chapterSelect").addEventListener("change", () => {
-  loadChapter($("chapterSelect").value);
-});
+}
 
 function startPolling() {
   if (state.poller) clearInterval(state.poller);
@@ -148,9 +393,6 @@ async function pollJob() {
     state.lastJob = data;
     renderJob(data);
     stopPollingIfIdle(data.status);
-    if (data.status === "completed" && !state.previewLoaded) {
-      enterPreview(data);
-    }
   } catch (error) {
     showError(error.message);
     if (state.poller) clearInterval(state.poller);
@@ -196,8 +438,12 @@ async function stopCondense() {
 
 async function exportChapters(chapterIds) {
   if (!state.jobId) return;
+  await downloadJob(state.jobId, chapterIds);
+}
+
+async function downloadJob(jobId, chapterIds = []) {
   try {
-    const response = await fetch(`/api/jobs/${state.jobId}/exports`, {
+    const response = await fetch(`/api/jobs/${jobId}/exports`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ chapter_ids: chapterIds }),
@@ -217,12 +463,22 @@ async function exportChapters(chapterIds) {
 
 function renderJob(job) {
   if (!job) return;
+  if (!job.error) hideError();
   $("progressPanel").classList.remove("hidden");
   $("statusText").textContent = statusLabels[job.status] || job.status;
   $("progressText").textContent = `${job.progress || 0}%`;
   $("etaText").textContent = formatEta(job.eta_seconds, job.status);
   $("elapsedText").textContent = formatElapsed(job.elapsed_seconds, job.status);
   setProgress(job.progress || 0);
+
+  if (job.status === "completed") {
+    $("downloadBtn").classList.remove("hidden");
+    $("downloadBtn").href = `/api/jobs/${job.id}/download`;
+    $("subtitle").textContent = job.title ? `${job.title} - 已完成` : "浓缩完成";
+  } else {
+    $("downloadBtn").classList.add("hidden");
+    $("subtitle").textContent = job.title || "EPUB / PDF / TXT → 浓缩 EPUB";
+  }
 
   if (job.title || job.integrity) {
     $("analysisPanel").classList.remove("hidden");
@@ -261,6 +517,10 @@ function renderChapterRow(chapter) {
     chapter.status === "failed"
       ? `<button class="row-action retry-chapter" data-chapter-id="${escapeHtml(chapter.id)}" type="button">重试</button>`
       : "";
+  const preview =
+    chapter.status === "done"
+      ? `<button class="row-action preview-chapter" data-chapter-id="${escapeHtml(chapter.id)}" type="button">预览</button>`
+      : "";
   return `
     <tr>
       <td class="select-col">
@@ -273,7 +533,7 @@ function renderChapterRow(chapter) {
       <td>${formatNumber(chapter.original_count)}</td>
       <td><span class="pill ${cls}">${chapterStatusLabels[chapter.status] || chapter.status}</span></td>
       <td>${chapter.condensed_count ? formatNumber(chapter.condensed_count) : "-"}</td>
-      <td>${retry}</td>
+      <td>${preview}${retry}</td>
     </tr>
   `;
 }
@@ -292,6 +552,9 @@ function bindRowControls() {
   });
   document.querySelectorAll(".retry-chapter").forEach((button) => {
     button.addEventListener("click", () => retryChapter(button.dataset.chapterId));
+  });
+  document.querySelectorAll(".preview-chapter").forEach((button) => {
+    button.addEventListener("click", () => previewChapter(button.dataset.chapterId));
   });
 }
 
@@ -315,38 +578,35 @@ function renderSelectionState(job) {
   $("condenseSelectedBtn").disabled = selected.length === 0 || job.status === "condensing";
 }
 
-function enterPreview(job) {
-  state.previewLoaded = true;
-  $("previewView").classList.remove("hidden");
-  $("downloadBtn").classList.remove("hidden");
-  $("downloadBtn").href = `/api/jobs/${job.id}/download`;
-  $("subtitle").textContent = job.title ? `${job.title} - 浓缩完成` : "浓缩完成";
-  $("chapterSelect").innerHTML = job.chapters
-    .filter((chapter) => chapter.status === "done")
-    .map((chapter) => `<option value="${escapeHtml(chapter.id)}">${escapeHtml(chapter.title)}</option>`)
-    .join("");
-  const first = $("chapterSelect").value;
-  if (first) loadChapter(first);
-}
-
-async function loadChapter(chapterId) {
+async function previewChapter(chapterId) {
   if (!state.jobId || !chapterId) return;
+  window.scrollTo(0, 0);
+  $("uploadView").classList.add("hidden");
+  $("libraryView").classList.add("hidden");
+  $("authPanel").classList.add("hidden");
+  $("previewView").classList.remove("hidden");
+  $("subtitle").textContent = "章节预览";
+  $("previewOriginalTitle").textContent = "加载中";
   $("previewTitle").textContent = "加载中";
+  $("originalContent").innerHTML = "";
   $("previewContent").innerHTML = "";
-  $("previewMeta").textContent = "";
+  $("originalCountText").textContent = "-";
+  $("condensedCountText").textContent = "-";
+
   const response = await fetch(`/api/jobs/${state.jobId}/chapters/${chapterId}`);
   const data = await response.json();
   if (!response.ok) {
+    $("previewOriginalTitle").textContent = "章节加载失败";
     $("previewTitle").textContent = "章节加载失败";
     $("previewContent").textContent = data.detail || "无法读取章节";
     return;
   }
+  $("previewOriginalTitle").textContent = data.title;
   $("previewTitle").textContent = data.title;
-  $("previewContent").innerHTML = textToParagraphs(data.content);
-  $("previewMeta").innerHTML = `
-    <div>原字数：${formatNumber(data.original_count)}</div>
-    <div>浓缩后：${formatNumber(data.condensed_count)}</div>
-  `;
+  $("originalContent").innerHTML = textToParagraphs(data.original_content);
+  $("previewContent").innerHTML = textToParagraphs(data.condensed_content || data.content);
+  $("originalCountText").textContent = `原字数 ${formatNumber(data.original_count)}`;
+  $("condensedCountText").textContent = `浓缩后 ${formatNumber(data.condensed_count)}`;
 }
 
 function getSelectedChapterIds() {
@@ -394,8 +654,21 @@ function looksLikeAuthFailure(message) {
 }
 
 function showError(message) {
+  if (!message) {
+    hideError();
+    return;
+  }
+  $("globalError").textContent = message;
+  $("globalError").classList.remove("hidden");
   $("errorText").textContent = message;
   $("errorText").classList.remove("hidden");
+}
+
+function hideError() {
+  $("globalError").textContent = "";
+  $("globalError").classList.add("hidden");
+  $("errorText").textContent = "";
+  $("errorText").classList.add("hidden");
 }
 
 function formatEta(seconds, status) {
@@ -427,6 +700,16 @@ function formatDuration(seconds) {
 
 function formatNumber(value) {
   return new Intl.NumberFormat("zh-CN").format(value || 0);
+}
+
+function formatDate(seconds) {
+  if (!seconds) return "-";
+  return new Intl.DateTimeFormat("zh-CN", {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(new Date(seconds * 1000));
 }
 
 function textToParagraphs(text) {
