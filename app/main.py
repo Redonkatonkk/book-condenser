@@ -10,8 +10,16 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from app import config
+from app.credentials import MiniMaxCredential
 from app.job_manager import JobManager
-from app.user_store import SESSION_TTL_SECONDS, User
+from app.minimax_client import MiniMaxAuthError, MiniMaxError
+from app.user_store import (
+    SESSION_TTL_SECONDS,
+    AccountLockedError,
+    InvalidPasswordError,
+    UnknownUserError,
+    User,
+)
 
 
 app = FastAPI(title="书籍浓缩器", version="1.0.0")
@@ -106,10 +114,14 @@ def register(request: AuthRequest, response: Response) -> dict:
 def login(request: AuthRequest, response: Response) -> dict:
     try:
         user = manager.user_store.authenticate(request.email, request.password)
+    except UnknownUserError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except InvalidPasswordError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+    except AccountLockedError as exc:
+        raise HTTPException(status_code=423, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    if not user:
-        raise HTTPException(status_code=401, detail="邮箱或密码不正确。")
     token = manager.user_store.create_session(user.id)
     set_session_cookie(response, token)
     return {"user": user_payload(user)}
@@ -135,9 +147,19 @@ def get_account_api_key(user: User = Depends(require_user)) -> dict:
 def save_account_api_key(request: ApiKeyRequest, user: User = Depends(require_user)) -> dict:
     try:
         if request.api_key.strip():
-            manager.user_store.save_api_key(user.id, request.api_key, request.region)
+            region = request.region.strip().lower()
+            if region not in config.REGION_ENDPOINTS:
+                region = config.DEFAULT_REGION
+            credential = MiniMaxCredential(api_key=request.api_key.strip(), region=region)
+            manager.ai_client.validate_api_key(
+                credential.api_key,
+                api_url=credential.resolved_api_url,
+            )
+            manager.user_store.save_api_key(user.id, credential.api_key, credential.region)
         else:
             manager.user_store.clear_api_key(user.id)
+    except (MiniMaxAuthError, MiniMaxError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     current = manager.user_store.get_user(user.id) or user

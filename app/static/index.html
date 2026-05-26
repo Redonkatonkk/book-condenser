@@ -45,30 +45,45 @@
             />
           </label>
           <button type="submit">登录</button>
-        </form>
-
-        <form id="registerForm" class="auth-card">
-          <h2>创建账户</h2>
-          <label class="field">
-            <span>Email</span>
-            <input id="registerEmail" name="email" type="email" autocomplete="email" required />
-          </label>
-          <label class="field">
-            <span>密码</span>
-            <input
-              id="registerPassword"
-              name="password"
-              type="password"
-              autocomplete="new-password"
-              minlength="6"
-              required
-            />
-          </label>
-          <button type="submit">创建并进入</button>
+          <div id="accountCreatePrompt" class="account-create-prompt hidden">
+            <span>查询不到该账号，是否创建账号？</span>
+            <button id="createMissingAccountBtn" type="button">是，创建并登录</button>
+            <button id="cancelCreateAccountBtn" class="secondary" type="button">取消</button>
+          </div>
         </form>
       </section>
 
       <section id="libraryView" class="library-view hidden">
+        <form id="libraryUploadForm" class="upload-panel library-upload-panel">
+          <label class="file-drop" for="libraryFileInput">
+            <span id="libraryFileName">选择书籍文件</span>
+            <input id="libraryFileInput" name="file" type="file" accept=".epub,.pdf,.txt" required />
+          </label>
+
+          <label class="field">
+            <span>MiniMax 模型</span>
+            <select id="libraryModelSelect" name="model"></select>
+          </label>
+
+          <label id="libraryRegionField" class="field">
+            <span>服务区</span>
+            <select id="libraryRegionSelect" name="region"></select>
+          </label>
+
+          <label id="libraryApiKeyField" class="field hidden">
+            <span>MiniMax API Key</span>
+            <input
+              id="libraryApiKeyInput"
+              name="api_key"
+              type="password"
+              autocomplete="off"
+              placeholder="保存个人 Key 或本次填写"
+            />
+          </label>
+
+          <button id="libraryStartBtn" type="submit">上传并分析</button>
+        </form>
+
         <section class="account-panel">
           <div>
             <span class="metric-label">账户</span>

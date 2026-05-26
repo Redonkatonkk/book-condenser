@@ -8,6 +8,7 @@ const state = {
   hasBackendApiKey: true,
   selectedChapters: new Set(),
   libraryJobs: [],
+  pendingAccount: null,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -53,8 +54,9 @@ function bindActions() {
   $("workspaceBtn").addEventListener("click", showWorkspace);
   $("libraryBtn").addEventListener("click", () => showLibrary());
   $("logoutBtn").addEventListener("click", logout);
-  $("loginForm").addEventListener("submit", (event) => submitAuth(event, "login"));
-  $("registerForm").addEventListener("submit", (event) => submitAuth(event, "register"));
+  $("loginForm").addEventListener("submit", submitLogin);
+  $("createMissingAccountBtn").addEventListener("click", createPendingAccount);
+  $("cancelCreateAccountBtn").addEventListener("click", clearCreatePrompt);
   $("accountKeyForm").addEventListener("submit", saveAccountKey);
   $("clearAccountKeyBtn").addEventListener("click", clearAccountKey);
   $("refreshLibraryBtn").addEventListener("click", refreshLibrary);
@@ -83,8 +85,15 @@ function bindActions() {
     const file = event.target.files[0];
     $("fileName").textContent = file ? file.name : "选择书籍文件";
   });
+  $("libraryFileInput").addEventListener("change", (event) => {
+    const file = event.target.files[0];
+    $("libraryFileName").textContent = file ? file.name : "选择书籍文件";
+  });
 
-  $("uploadForm").addEventListener("submit", createJobFromUpload);
+  $("uploadForm").addEventListener("submit", (event) => createJobFromUpload(event, "workspace"));
+  $("libraryUploadForm").addEventListener("submit", (event) =>
+    createJobFromUpload(event, "library"),
+  );
 }
 
 async function refreshAuth() {
@@ -101,13 +110,17 @@ async function loadModels() {
     .map((model) => `<option value="${escapeHtml(model)}">${escapeHtml(model)}</option>`)
     .join("");
   $("modelSelect").value = data.default;
+  $("libraryModelSelect").innerHTML = $("modelSelect").innerHTML;
+  $("libraryModelSelect").value = data.default;
   const regionOptions = data.regions
     .map((region) => `<option value="${escapeHtml(region.id)}">${escapeHtml(region.label)}</option>`)
     .join("");
   $("regionSelect").innerHTML = regionOptions;
+  $("libraryRegionSelect").innerHTML = regionOptions;
   $("accountRegionSelect").innerHTML = regionOptions;
   const selectedRegion = data.stored_region || data.default_region || "cn";
   $("regionSelect").value = selectedRegion;
+  $("libraryRegionSelect").value = selectedRegion;
   $("accountRegionSelect").value = selectedRegion;
   state.hasBackendApiKey = Boolean(data.has_api_key);
   renderApiKeyRequirement();
@@ -131,6 +144,7 @@ function renderAccount() {
 
 function showAuthPanel() {
   window.scrollTo(0, 0);
+  $("loginOpenBtn").classList.add("hidden");
   $("authPanel").classList.remove("hidden");
   $("libraryView").classList.add("hidden");
   $("uploadView").classList.add("hidden");
@@ -141,6 +155,7 @@ function showAuthPanel() {
 
 function showWorkspace() {
   window.scrollTo(0, 0);
+  renderAuth();
   $("authPanel").classList.add("hidden");
   $("libraryView").classList.add("hidden");
   $("uploadView").classList.remove("hidden");
@@ -148,7 +163,7 @@ function showWorkspace() {
   if (state.lastJob) {
     renderJob(state.lastJob);
   } else {
-    $("downloadBtn").classList.add("hidden");
+    resetJobPanels();
     $("subtitle").textContent = "EPUB / PDF / TXT → 浓缩 EPUB";
   }
 }
@@ -159,6 +174,7 @@ async function showLibrary() {
     return;
   }
   window.scrollTo(0, 0);
+  renderAuth();
   $("authPanel").classList.add("hidden");
   $("uploadView").classList.add("hidden");
   $("previewView").classList.add("hidden");
@@ -168,19 +184,23 @@ async function showLibrary() {
   await refreshLibrary();
 }
 
-async function submitAuth(event, mode) {
+async function submitLogin(event) {
   event.preventDefault();
-  const prefix = mode === "login" ? "login" : "register";
-  const email = $(`${prefix}Email`).value.trim();
-  const password = $(`${prefix}Password`).value;
+  const email = $("loginEmail").value.trim();
+  const password = $("loginPassword").value;
+  clearCreatePrompt();
   try {
-    const response = await fetch(`/api/auth/${mode}`, {
+    const response = await fetch("/api/auth/login", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ email, password }),
     });
     const data = await response.json();
-    if (!response.ok) throw new Error(data.detail || "认证失败");
+    if (response.status === 404) {
+      showCreatePrompt(email, password);
+      return;
+    }
+    if (!response.ok) throw new Error(data.detail || "登录失败");
     state.user = data.user;
     renderAuth();
     await loadModels();
@@ -188,6 +208,48 @@ async function submitAuth(event, mode) {
   } catch (error) {
     showError(error.message);
   }
+}
+
+function showCreatePrompt(email, password) {
+  state.pendingAccount = { email, password };
+  hideError();
+  $("accountCreatePrompt").classList.remove("hidden");
+  $("createMissingAccountBtn").focus();
+}
+
+function clearCreatePrompt() {
+  state.pendingAccount = null;
+  $("accountCreatePrompt").classList.add("hidden");
+}
+
+async function createPendingAccount() {
+  const account = state.pendingAccount;
+  if (!account) {
+    return;
+  }
+  $("createMissingAccountBtn").disabled = true;
+  try {
+    await createAccountAndLogin(account.email, account.password);
+  } catch (error) {
+    showError(error.message);
+  } finally {
+    $("createMissingAccountBtn").disabled = false;
+  }
+}
+
+async function createAccountAndLogin(email, password) {
+  const response = await fetch("/api/auth/register", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email, password }),
+  });
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.detail || "创建账号失败");
+  state.user = data.user;
+  clearCreatePrompt();
+  renderAuth();
+  await loadModels();
+  await showLibrary();
 }
 
 async function logout() {
@@ -327,47 +389,78 @@ async function deleteJob(jobId) {
   }
 }
 
-async function createJobFromUpload(event) {
+async function createJobFromUpload(event, source) {
   event.preventDefault();
-  const file = $("fileInput").files[0];
+  const ids =
+    source === "library"
+      ? {
+          fileInput: "libraryFileInput",
+          fileName: "libraryFileName",
+          modelSelect: "libraryModelSelect",
+          regionSelect: "libraryRegionSelect",
+          apiKeyInput: "libraryApiKeyInput",
+          startBtn: "libraryStartBtn",
+        }
+      : {
+          fileInput: "fileInput",
+          fileName: "fileName",
+          modelSelect: "modelSelect",
+          regionSelect: "regionSelect",
+          apiKeyInput: "apiKeyInput",
+          startBtn: "startBtn",
+        };
+  const file = $(ids.fileInput).files[0];
   if (!file) return;
-  const apiKey = $("apiKeyInput").value.trim();
+  const apiKey = $(ids.apiKeyInput).value.trim();
   if (!state.hasBackendApiKey && !apiKey) {
     showError("请先填写 MiniMax API Key。");
-    $("apiKeyInput").focus();
+    $(ids.apiKeyInput).focus();
     return;
   }
 
-  $("startBtn").disabled = true;
+  $(ids.startBtn).disabled = true;
   hideError();
-  $("analysisPanel").classList.add("hidden");
-  $("actionPanel").classList.add("hidden");
-  $("progressPanel").classList.remove("hidden");
-  $("chapterPanel").classList.add("hidden");
-  $("previewView").classList.add("hidden");
-  $("downloadBtn").classList.add("hidden");
-  $("statusText").textContent = "上传中";
-  $("progressText").textContent = "0%";
-  $("elapsedText").textContent = "-";
-  setProgress(0);
+  if (source === "workspace") {
+    $("analysisPanel").classList.add("hidden");
+    $("actionPanel").classList.add("hidden");
+    $("progressPanel").classList.remove("hidden");
+    $("chapterPanel").classList.add("hidden");
+    $("previewView").classList.add("hidden");
+    $("downloadBtn").classList.add("hidden");
+    $("statusText").textContent = "上传中";
+    $("progressText").textContent = "0%";
+    $("elapsedText").textContent = "-";
+    setProgress(0);
+  }
   state.selectedChapters.clear();
 
   const form = new FormData();
   form.append("file", file);
-  form.append("model", $("modelSelect").value);
-  form.append("region", $("regionSelect").value);
+  form.append("model", $(ids.modelSelect).value);
+  form.append("region", $(ids.regionSelect).value);
   if (apiKey) form.append("api_key", apiKey);
 
+  let keepDisabled = false;
   try {
     const response = await fetch("/api/jobs", { method: "POST", body: form });
     const data = await response.json();
     if (!response.ok) throw new Error(data.detail || "创建任务失败");
-    state.jobId = data.job_id;
-    localStorage.setItem(ACTIVE_JOB_KEY, state.jobId);
-    startPolling();
+    $(ids.fileInput).value = "";
+    $(ids.fileName).textContent = "选择书籍文件";
+    $(ids.apiKeyInput).value = "";
+    if (source === "library") {
+      await refreshLibrary();
+      setTimeout(refreshLibrary, 1500);
+    } else {
+      state.jobId = data.job_id;
+      localStorage.setItem(ACTIVE_JOB_KEY, state.jobId);
+      keepDisabled = true;
+      startPolling();
+    }
   } catch (error) {
     showError(error.message);
-    $("startBtn").disabled = false;
+  } finally {
+    if (!keepDisabled) $(ids.startBtn).disabled = false;
   }
 }
 
@@ -389,6 +482,15 @@ async function pollJob() {
   try {
     const response = await fetch(`/api/jobs/${state.jobId}`);
     const data = await response.json();
+    if (response.status === 404) {
+      clearActiveJob();
+      if (state.user) {
+        await showLibrary();
+      } else {
+        showWorkspace();
+      }
+      return;
+    }
     if (!response.ok) throw new Error(data.detail || "读取任务失败");
     state.lastJob = data;
     renderJob(data);
@@ -399,6 +501,32 @@ async function pollJob() {
     state.poller = null;
     $("startBtn").disabled = false;
   }
+}
+
+function clearActiveJob() {
+  if (state.poller) clearInterval(state.poller);
+  state.poller = null;
+  state.jobId = null;
+  state.lastJob = null;
+  state.selectedChapters.clear();
+  localStorage.removeItem(ACTIVE_JOB_KEY);
+  resetJobPanels();
+  hideError();
+}
+
+function resetJobPanels() {
+  $("analysisPanel").classList.add("hidden");
+  $("actionPanel").classList.add("hidden");
+  $("progressPanel").classList.add("hidden");
+  $("chapterPanel").classList.add("hidden");
+  $("previewView").classList.add("hidden");
+  $("downloadBtn").classList.add("hidden");
+  $("startBtn").disabled = false;
+  $("statusText").textContent = "等待任务";
+  $("progressText").textContent = "0%";
+  $("elapsedText").textContent = "-";
+  $("etaText").textContent = "-";
+  setProgress(0);
 }
 
 async function startCondense(mode, chapterIds = []) {
@@ -634,19 +762,24 @@ function setProgress(value) {
 }
 
 function renderApiKeyRequirement() {
-  const form = $("uploadForm");
-  const field = $("apiKeyField");
-  const input = $("apiKeyInput");
-  if (state.hasBackendApiKey) {
-    form.classList.remove("needs-key");
-    field.classList.add("hidden");
-    input.required = false;
-    input.value = "";
-    return;
-  }
-  form.classList.add("needs-key");
-  field.classList.remove("hidden");
-  input.required = true;
+  [
+    ["uploadForm", "apiKeyField", "apiKeyInput"],
+    ["libraryUploadForm", "libraryApiKeyField", "libraryApiKeyInput"],
+  ].forEach(([formId, fieldId, inputId]) => {
+    const form = $(formId);
+    const field = $(fieldId);
+    const input = $(inputId);
+    if (state.hasBackendApiKey) {
+      form.classList.remove("needs-key");
+      field.classList.add("hidden");
+      input.required = false;
+      input.value = "";
+      return;
+    }
+    form.classList.add("needs-key");
+    field.classList.remove("hidden");
+    input.required = true;
+  });
 }
 
 function looksLikeAuthFailure(message) {

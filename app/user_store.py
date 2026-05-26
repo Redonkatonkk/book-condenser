@@ -17,6 +17,21 @@ from app.credentials import MiniMaxCredential
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 PASSWORD_ITERATIONS = 260_000
 SESSION_TTL_SECONDS = 60 * 60 * 24 * 30
+FAILED_LOGIN_WINDOW_SECONDS = 60 * 30
+LOCKOUT_SECONDS = 60 * 60 * 24
+MAX_FAILED_LOGINS = 5
+
+
+class UnknownUserError(ValueError):
+    pass
+
+
+class InvalidPasswordError(ValueError):
+    pass
+
+
+class AccountLockedError(ValueError):
+    pass
 
 
 @dataclass(frozen=True)
@@ -63,16 +78,32 @@ class UserStore:
             raise ValueError("这个邮箱已经注册。") from exc
         return User(id=user_id, email=normalized_email, created_at=now)
 
-    def authenticate(self, email: str, password: str) -> User | None:
+    def authenticate(self, email: str, password: str) -> User:
         normalized_email = self._normalize_email(email)
+        now = time.time()
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT * FROM users WHERE email = ?",
                 (normalized_email,),
             ).fetchone()
-        if not row or not self._verify_password(password, row["password_hash"]):
-            return None
-        return self._row_to_user(row)
+            if not row:
+                raise UnknownUserError("账号不存在。")
+            locked_until = float(row["locked_until"] or 0)
+            if locked_until > now:
+                raise AccountLockedError("该账号已锁定 24 小时，请稍后再试。")
+            if not self._verify_password(password, row["password_hash"]):
+                self._record_failed_login(conn, row, now)
+            conn.execute(
+                """
+                UPDATE users
+                SET failed_login_count = 0,
+                    failed_login_window_start = 0,
+                    locked_until = 0
+                WHERE id = ?
+                """,
+                (row["id"],),
+            )
+        return self.get_user(str(row["id"])) or self._row_to_user(row)
 
     def get_user(self, user_id: str) -> User | None:
         if not user_id:
@@ -168,10 +199,14 @@ class UserStore:
                     api_key TEXT NOT NULL DEFAULT '',
                     region TEXT NOT NULL DEFAULT '',
                     api_url TEXT NOT NULL DEFAULT '',
+                    failed_login_count INTEGER NOT NULL DEFAULT 0,
+                    failed_login_window_start REAL NOT NULL DEFAULT 0,
+                    locked_until REAL NOT NULL DEFAULT 0,
                     created_at REAL NOT NULL
                 )
                 """
             )
+            self._ensure_user_columns(conn)
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS sessions (
@@ -185,6 +220,20 @@ class UserStore:
             )
             conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at)")
+
+    def _ensure_user_columns(self, conn: sqlite3.Connection) -> None:
+        existing = {
+            str(row["name"])
+            for row in conn.execute("PRAGMA table_info(users)").fetchall()
+        }
+        columns = {
+            "failed_login_count": "INTEGER NOT NULL DEFAULT 0",
+            "failed_login_window_start": "REAL NOT NULL DEFAULT 0",
+            "locked_until": "REAL NOT NULL DEFAULT 0",
+        }
+        for name, definition in columns.items():
+            if name not in existing:
+                conn.execute(f"ALTER TABLE users ADD COLUMN {name} {definition}")
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path, timeout=30)
@@ -201,6 +250,38 @@ class UserStore:
     def _validate_password(self, password: str) -> None:
         if len(password) < 6:
             raise ValueError("密码至少需要 6 位。")
+
+    def _record_failed_login(
+        self,
+        conn: sqlite3.Connection,
+        row: sqlite3.Row,
+        now: float,
+    ) -> None:
+        window_start = float(row["failed_login_window_start"] or 0)
+        failed_count = int(row["failed_login_count"] or 0)
+        if not window_start or now - window_start > FAILED_LOGIN_WINDOW_SECONDS:
+            window_start = now
+            failed_count = 0
+        failed_count += 1
+        locked_until = 0.0
+        message = "密码错误。"
+        if failed_count >= MAX_FAILED_LOGINS:
+            locked_until = now + LOCKOUT_SECONDS
+            message = "密码错误次数过多，该账号已锁定 24 小时。"
+        conn.execute(
+            """
+            UPDATE users
+            SET failed_login_count = ?,
+                failed_login_window_start = ?,
+                locked_until = ?
+            WHERE id = ?
+            """,
+            (failed_count, window_start, locked_until, row["id"]),
+        )
+        conn.commit()
+        if locked_until:
+            raise AccountLockedError(message)
+        raise InvalidPasswordError(message)
 
     def _hash_password(self, password: str) -> str:
         salt = secrets.token_bytes(16)

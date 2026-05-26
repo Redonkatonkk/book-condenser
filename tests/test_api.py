@@ -5,13 +5,16 @@ import time
 import math
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 from starlette.datastructures import UploadFile
 
 from app import job_manager as job_manager_module
+from app import user_store as user_store_module
 from app.job_manager import JobManager
 from app.main import app, manager
-from app.minimax_client import MiniMaxAuthError
+from app.minimax_client import MiniMaxAuthError, MiniMaxClient
+from app.user_store import AccountLockedError, InvalidPasswordError, UnknownUserError, UserStore
 
 
 def test_upload_poll_preview_and_download(tmp_path: Path) -> None:
@@ -254,6 +257,87 @@ def test_login_personal_library_and_job_access(tmp_path: Path) -> None:
     assert client.get("/api/me/jobs").json()["jobs"] == []
 
 
+def test_login_distinguishes_unknown_wrong_password_and_lockout(tmp_path: Path) -> None:
+    reset_app_manager(tmp_path)
+    client = TestClient(app)
+
+    missing = client.post(
+        "/api/auth/login",
+        json={"email": "missing@example.com", "password": "secretpw"},
+    )
+    assert missing.status_code == 404
+    assert "账号不存在" in missing.json()["detail"]
+
+    register = client.post(
+        "/api/auth/register",
+        json={"email": "lock@example.com", "password": "secretpw"},
+    )
+    assert register.status_code == 200
+    client.post("/api/auth/logout")
+
+    for _ in range(4):
+        wrong = client.post(
+            "/api/auth/login",
+            json={"email": "lock@example.com", "password": "badpass"},
+        )
+        assert wrong.status_code == 401
+        assert "密码错误" in wrong.json()["detail"]
+
+    locked = client.post(
+        "/api/auth/login",
+        json={"email": "lock@example.com", "password": "badpass"},
+    )
+    assert locked.status_code == 423
+    assert "锁定" in locked.json()["detail"]
+
+    still_locked = client.post(
+        "/api/auth/login",
+        json={"email": "lock@example.com", "password": "secretpw"},
+    )
+    assert still_locked.status_code == 423
+
+
+def test_failed_login_window_resets_and_lock_expires(tmp_path: Path, monkeypatch) -> None:
+    now = 1000.0
+    monkeypatch.setattr(user_store_module.time, "time", lambda: now)
+    store = UserStore(tmp_path)
+    store.create_user("window@example.com", "secretpw")
+
+    with pytest.raises(InvalidPasswordError):
+        store.authenticate("window@example.com", "badpass")
+    now += user_store_module.FAILED_LOGIN_WINDOW_SECONDS + 1
+    for _ in range(user_store_module.MAX_FAILED_LOGINS - 1):
+        with pytest.raises(InvalidPasswordError):
+            store.authenticate("window@example.com", "badpass")
+    with pytest.raises(AccountLockedError):
+        store.authenticate("window@example.com", "badpass")
+
+    now += user_store_module.LOCKOUT_SECONDS + 1
+    assert store.authenticate("window@example.com", "secretpw").email == "window@example.com"
+
+    with pytest.raises(UnknownUserError):
+        store.authenticate("none@example.com", "secretpw")
+
+
+def test_account_api_key_is_validated_before_save(tmp_path: Path) -> None:
+    reset_app_manager(tmp_path)
+    manager.ai_client = RejectingClient(api_key="")
+    client = TestClient(app)
+    register = client.post(
+        "/api/auth/register",
+        json={"email": "keycheck@example.com", "password": "secretpw"},
+    )
+    assert register.status_code == 200
+
+    save_key = client.put(
+        "/api/account/api-key",
+        json={"api_key": "bad-key", "region": "cn"},
+    )
+    assert save_key.status_code == 400
+    assert "鉴权" in save_key.json()["detail"]
+    assert manager.user_store.get_credential(register.json()["user"]["id"]) is None
+
+
 def test_user_key_is_used_and_job_state_survives_reload(tmp_path: Path) -> None:
     client_impl = DummyClient(api_key="server-key")
     isolated = JobManager(storage_dir=tmp_path, ai_client=client_impl)
@@ -456,6 +540,7 @@ def wait_for_manager_status(manager: JobManager, job_id: str, statuses: set[str]
 
 def reset_app_manager(tmp_path: Path) -> None:
     manager.configure_storage(tmp_path)
+    manager.ai_client = MiniMaxClient()
     manager.ai_client.mock_mode = True
     with manager.lock:
         manager.jobs.clear()
